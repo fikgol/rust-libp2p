@@ -52,7 +52,7 @@ impl PeerId {
     #[inline]
     pub fn from_public_key(key: PublicKey) -> PeerId {
         let key_enc = key.into_protobuf_encoding();
-        let multihash = multihash::encode(multihash::Hash::SHA2256, &key_enc)
+        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc)
             .expect("sha2-256 is always supported");
         PeerId { multihash }
     }
@@ -63,7 +63,7 @@ impl PeerId {
     pub fn from_bytes(data: Vec<u8>) -> Result<PeerId, Vec<u8>> {
         match multihash::Multihash::from_bytes(data) {
             Ok(multihash) => {
-                if multihash.algorithm() == multihash::Hash::SHA2256 {
+                if multihash.algorithm() == multihash::Hash::SHA3256 {
                     Ok(PeerId { multihash })
                 } else {
                     Err(multihash.into_bytes())
@@ -77,7 +77,7 @@ impl PeerId {
     /// returns back the data as an error.
     #[inline]
     pub fn from_multihash(data: multihash::Multihash) -> Result<PeerId, multihash::Multihash> {
-        if data.algorithm() == multihash::Hash::SHA2256 {
+        if data.algorithm() == multihash::Hash::SHA3256 {
             Ok(PeerId { multihash: data })
         } else {
             Err(data)
@@ -90,7 +90,7 @@ impl PeerId {
     #[inline]
     pub fn random() -> PeerId {
         PeerId {
-            multihash: multihash::Multihash::random(multihash::Hash::SHA2256)
+            multihash: multihash::Multihash::random(multihash::Hash::SHA3256)
         }
     }
 
