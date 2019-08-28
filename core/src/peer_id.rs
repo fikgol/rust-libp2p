@@ -52,8 +52,8 @@ impl PeerId {
     #[inline]
     pub fn from_public_key(key: PublicKey) -> PeerId {
         let key_enc = key.into_protobuf_encoding();
-        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc)
-            .expect("sha2-256 is always supported");
+        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc[2..])
+            .expect("sha3-256 is always supported");
         PeerId { multihash }
     }
 
