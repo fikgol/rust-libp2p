@@ -51,9 +51,14 @@ impl PeerId {
     /// Builds a `PeerId` from a public key.
     #[inline]
     pub fn from_public_key(key: PublicKey) -> PeerId {
-        let key_enc = key.into_protobuf_encoding();
-        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc)
-            .expect("sha2-256 is always supported");
+        let key_enc = match key {
+            PublicKey::Ed25519(pub_key) => {
+                Some(pub_key.encode().to_vec())
+            }
+            _ => {None}
+        };
+        let multihash = multihash::encode(multihash::Hash::SHA3256, &key_enc.unwrap())
+        .expect("sha3-256 is always supported");
         PeerId { multihash }
     }
 
@@ -68,7 +73,7 @@ impl PeerId {
                 } else {
                     Err(multihash.into_bytes())
                 }
-            },
+            }
             Err(err) => Err(err.data),
         }
     }
@@ -245,7 +250,7 @@ mod tests {
 
     #[test]
     fn random_peer_id_is_valid() {
-        for _ in 0 .. 5000 {
+        for _ in 0..5000 {
             let peer_id = PeerId::random();
             assert_eq!(peer_id, PeerId::from_bytes(peer_id.clone().into_bytes()).unwrap());
         }
