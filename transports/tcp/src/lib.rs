@@ -43,24 +43,24 @@ use futures::{
     prelude::*,
     stream::{self, Chain, IterOk, Once}
 };
-use get_if_addrs::get_if_addrs;
+use get_if_addrs::{IfAddr, get_if_addrs};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use libp2p_core::{
     Transport,
     multiaddr::{Protocol, Multiaddr},
     transport::{ListenerEvent, TransportError}
 };
-use log::{debug, error, trace};
+use log::{debug, trace};
 use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
+    collections::VecDeque,
     io::{self, Read, Write},
     iter::{self, FromIterator},
     net::{IpAddr, SocketAddr},
-    time::Duration,
+    time::{Duration, Instant},
     vec::IntoIter
 };
-use tk_listen::{ListenExt, SleepOnError};
 use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_timer::Delay;
 use tokio_tcp::{ConnectFuture, Incoming, TcpStream};
 
 /// Represents the configuration for a TCP/IP transport capability for libp2p.
@@ -152,10 +152,10 @@ impl Transport for TcpConfig {
         let addrs =
             if socket_addr.ip().is_unspecified() {
                 let addrs = host_addresses(port).map_err(TransportError::Other)?;
-                debug!("Listening on {:?}", addrs.values());
+                debug!("Listening on {:?}", addrs.iter().map(|(_, _, ma)| ma).collect::<Vec<_>>());
                 Addresses::Many(addrs)
             } else {
-                let ma = sockaddr_to_multiaddr(local_addr.ip(), port);
+                let ma = ip_to_multiaddr(local_addr.ip(), port);
                 debug!("Listening on {:?}", ma);
                 Addresses::One(ma)
             };
@@ -167,7 +167,8 @@ impl Transport for TcpConfig {
                 Either::A(stream::once(Ok(event)))
             }
             Addresses::Many(ref aa) => {
-                let events = aa.values()
+                let events = aa.iter()
+                    .map(|(_, _, ma)| ma)
                     .cloned()
                     .map(ListenerEvent::NewAddress)
                     .collect::<Vec<_>>();
@@ -176,7 +177,7 @@ impl Transport for TcpConfig {
         };
 
         let stream = TcpListenStream {
-            inner: Ok(listener.incoming().sleep_on_error(self.sleep_on_error)),
+            inner: Listener::new(listener.incoming(), self.sleep_on_error),
             port,
             addrs,
             pending: VecDeque::new(),
@@ -232,7 +233,7 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Result<SocketAddr, ()> {
 }
 
 // Create a [`Multiaddr`] from the given IP address and port number.
-fn sockaddr_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
+fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     let proto = match ip {
         IpAddr::V4(ip) => Protocol::Ip4(ip),
         IpAddr::V6(ip) => Protocol::Ip6(ip)
@@ -242,11 +243,26 @@ fn sockaddr_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
 }
 
 // Collect all local host addresses and use the provided port number as listen port.
-fn host_addresses(port: u16) -> io::Result<HashMap<IpAddr, Multiaddr>> {
-    let mut addrs = HashMap::new();
+fn host_addresses(port: u16) -> io::Result<Vec<(IpAddr, IpNet, Multiaddr)>> {
+    let mut addrs = Vec::new();
     for iface in get_if_addrs()? {
-        let ma = sockaddr_to_multiaddr(iface.ip(), port);
-        addrs.insert(iface.ip(), ma);
+        let ip = iface.ip();
+        let ma = ip_to_multiaddr(ip, port);
+        let ipn = match iface.addr {
+            IfAddr::V4(ip4) => {
+                let prefix_len = (!u32::from_be_bytes(ip4.netmask.octets())).leading_zeros();
+                let ipnet = Ipv4Net::new(ip4.ip, prefix_len as u8)
+                    .expect("prefix_len is the number of bits in a u32, so can not exceed 32");
+                IpNet::V4(ipnet)
+            }
+            IfAddr::V6(ip6) => {
+                let prefix_len = (!u128::from_be_bytes(ip6.netmask.octets())).leading_zeros();
+                let ipnet = Ipv6Net::new(ip6.ip, prefix_len as u8)
+                    .expect("prefix_len is the number of bits in a u128, so can not exceed 128");
+                IpNet::V6(ipnet)
+            }
+        };
+        addrs.push((ip, ipn, ma))
     }
     Ok(addrs)
 }
@@ -331,21 +347,127 @@ enum Addresses {
     /// A specific address is used to listen.
     One(Multiaddr),
     /// A set of addresses is used to listen.
-    Many(HashMap<IpAddr, Multiaddr>)
+    Many(Vec<(IpAddr, IpNet, Multiaddr)>)
+}
+
+type Buffer = VecDeque<ListenerEvent<FutureResult<TcpTransStream, io::Error>>>;
+
+/// Incoming connection stream which pauses after errors.
+#[derive(Debug)]
+struct Listener<S> {
+    /// The incoming connections.
+    stream: S,
+    /// The current pause if any.
+    pause: Option<Delay>,
+    /// How long to pause after an error.
+    pause_duration: Duration
+}
+
+impl<S> Listener<S>
+where
+    S: Stream,
+    S::Error: std::fmt::Display
+{
+    fn new(stream: S, duration: Duration) -> Self {
+        Listener { stream, pause: None, pause_duration: duration }
+    }
+}
+
+impl<S> Stream for Listener<S>
+where
+    S: Stream,
+    S::Error: std::fmt::Display
+{
+    type Item = S::Item;
+    type Error = S::Error;
+
+    /// Polls for incoming connections, pausing if an error is encountered.
+    fn poll(&mut self) -> Poll<Option<S::Item>, S::Error> {
+        match self.pause.as_mut().map(|p| p.poll()) {
+            Some(Ok(Async::NotReady)) => return Ok(Async::NotReady),
+            Some(Ok(Async::Ready(()))) | Some(Err(_)) => { self.pause.take(); }
+            None => ()
+        }
+
+        match self.stream.poll() {
+            Ok(x) => Ok(x),
+            Err(e) => {
+                debug!("error accepting incoming connection: {}", e);
+                self.pause = Some(Delay::new(Instant::now() + self.pause_duration));
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Stream that listens on an TCP/IP address.
+#[derive(Debug)]
 pub struct TcpListenStream {
     /// Stream of incoming sockets.
-    inner: Result<SleepOnError<Incoming>, Option<io::Error>>,
+    inner: Listener<Incoming>,
     /// The port which we use as our listen port in listener event addresses.
     port: u16,
     /// The set of known addresses.
     addrs: Addresses,
     /// Temporary buffer of listener events.
-    pending: VecDeque<ListenerEvent<FutureResult<TcpTransStream, io::Error>>>,
+    pending: Buffer,
     /// Original configuration.
     config: TcpConfig
+}
+
+// If we listen on all interfaces, find out to which interface the given
+// socket address belongs. In case we think the address is new, check
+// all host interfaces again and report new and expired listen addresses.
+fn check_for_interface_changes(
+    socket_addr: &SocketAddr,
+    listen_port: u16,
+    listen_addrs: &mut Vec<(IpAddr, IpNet, Multiaddr)>,
+    pending: &mut Buffer
+) -> Result<(), io::Error> {
+    // Check for exact match:
+    if listen_addrs.iter().find(|(ip, ..)| ip == &socket_addr.ip()).is_some() {
+        return Ok(())
+    }
+
+    // No exact match => check netmask
+    if listen_addrs.iter().find(|(_, net, _)| net.contains(&socket_addr.ip())).is_some() {
+        return Ok(())
+    }
+
+    // The local IP address of this socket is new to us.
+    // We check for changes in the set of host addresses and report new
+    // and expired addresses.
+    //
+    // TODO: We do not detect expired addresses unless there is a new address.
+    let old_listen_addrs = std::mem::replace(listen_addrs, host_addresses(listen_port)?);
+
+    // Check for addresses no longer in use.
+    for (ip, _, ma) in old_listen_addrs.iter() {
+        if listen_addrs.iter().find(|(i, ..)| i == ip).is_none() {
+            debug!("Expired listen address: {}", ma);
+            pending.push_back(ListenerEvent::AddressExpired(ma.clone()));
+        }
+    }
+
+    // Check for new addresses.
+    for (ip, _, ma) in listen_addrs.iter() {
+        if old_listen_addrs.iter().find(|(i, ..)| i == ip).is_none() {
+            debug!("New listen address: {}", ma);
+            pending.push_back(ListenerEvent::NewAddress(ma.clone()));
+        }
+    }
+
+    // We should now be able to find the local address, if not something
+    // is seriously wrong and we report an error.
+    if listen_addrs.iter()
+        .find(|(ip, net, _)| ip == &socket_addr.ip() || net.contains(&socket_addr.ip()))
+        .is_none()
+    {
+        let msg = format!("{} does not match any listen address", socket_addr.ip());
+        return Err(io::Error::new(io::ErrorKind::Other, msg))
+    }
+
+    Ok(())
 }
 
 impl Stream for TcpListenStream {
@@ -353,79 +475,47 @@ impl Stream for TcpListenStream {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, io::Error> {
-        let inner = match self.inner {
-            Ok(ref mut inc) => inc,
-            Err(ref mut err) => return Err(err.take().expect("poll called again after error"))
-        };
-
         loop {
             if let Some(event) = self.pending.pop_front() {
                 return Ok(Async::Ready(Some(event)))
             }
 
-            let sock = match inner.poll() {
+            let sock = match self.inner.poll() {
                 Ok(Async::Ready(Some(sock))) => sock,
                 Ok(Async::Ready(None)) => return Ok(Async::Ready(None)),
                 Ok(Async::NotReady) => return Ok(Async::NotReady),
-                Err(()) => unreachable!("sleep_on_error never produces an error")
+                Err(e) => return Err(e)
             };
 
             let sock_addr = match sock.peer_addr() {
                 Ok(addr) => addr,
                 Err(err) => {
-                    error!("Failed to get peer address: {:?}", err);
-                    return Err(err)
+                    debug!("Failed to get peer address: {:?}", err);
+                    continue
                 }
             };
 
-            let listen_addr = match sock.local_addr() {
-                Ok(addr) => match self.addrs {
-                    Addresses::One(ref ma) => ma.clone(),
-                    Addresses::Many(ref mut addrs) => if let Some(ma) = addrs.get(&addr.ip()) {
-                        ma.clone()
-                    } else {
-                        // The local IP address of this socket is new to us.
-                        // We need to check for changes in the set of host addresses and report
-                        // new and expired addresses.
-                        //
-                        // TODO: We do not detect expired addresses unless there is a new address.
-
-                        let new_addrs = host_addresses(self.port)?;
-                        let old_addrs = std::mem::replace(addrs, new_addrs);
-
-                        // Check for addresses no longer in use.
-                        for (ip, ma) in &old_addrs {
-                            if !addrs.contains_key(&ip) {
-                                debug!("Expired listen address: {}", ma);
-                                self.pending.push_back(ListenerEvent::AddressExpired(ma.clone()));
-                            }
-                        }
-
-                        // Check for new addresses.
-                        for (ip, ma) in addrs {
-                            if !old_addrs.contains_key(&ip) {
-                                debug!("New listen address: {}", ma);
-                                self.pending.push_back(ListenerEvent::NewAddress(ma.clone()));
-                            }
-                        }
-
-                        sockaddr_to_multiaddr(addr.ip(), self.port)
+            let local_addr = match sock.local_addr() {
+                Ok(sock_addr) => {
+                    if let Addresses::Many(ref mut addrs) = self.addrs {
+                        check_for_interface_changes(&sock_addr, self.port, addrs, &mut self.pending)?
                     }
+                    ip_to_multiaddr(sock_addr.ip(), sock_addr.port())
                 }
                 Err(err) => {
-                    error!("Failed to get local address of incoming socket: {:?}", err);
-                    return Err(err)
+                    debug!("Failed to get local address of incoming socket: {:?}", err);
+                    continue
                 }
             };
 
-            let remote_addr = sockaddr_to_multiaddr(sock_addr.ip(), sock_addr.port());
+            let remote_addr = ip_to_multiaddr(sock_addr.ip(), sock_addr.port());
 
             match apply_config(&self.config, &sock) {
                 Ok(()) => {
-                    trace!("Incoming connection from {} on {}", remote_addr, listen_addr);
+                    trace!("Incoming connection from {} at {}", remote_addr, local_addr);
                     self.pending.push_back(ListenerEvent::Upgrade {
                         upgrade: future::ok(TcpTransStream { inner: sock }),
-                        listen_addr,
+                        local_addr,
                         remote_addr
                     })
                 }
@@ -433,21 +523,11 @@ impl Stream for TcpListenStream {
                     debug!("Error upgrading incoming connection from {}: {:?}", remote_addr, err);
                     self.pending.push_back(ListenerEvent::Upgrade {
                         upgrade: future::err(err),
-                        listen_addr,
+                        local_addr,
                         remote_addr
                     })
                 }
             }
-        }
-    }
-}
-
-impl fmt::Debug for TcpListenStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.inner {
-            Ok(_) => write!(f, "TcpListenStream"),
-            Err(None) => write!(f, "TcpListenStream(Errored)"),
-            Err(Some(ref err)) => write!(f, "TcpListenStream({:?})", err),
         }
     }
 }
@@ -459,7 +539,6 @@ pub struct TcpTransStream {
 }
 
 impl Read for TcpTransStream {
-    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, io::Error> {
         self.inner.read(buf)
     }
@@ -476,26 +555,22 @@ impl AsyncRead for TcpTransStream {
 }
 
 impl Write for TcpTransStream {
-    #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize, io::Error> {
         self.inner.write(buf)
     }
 
-    #[inline]
     fn flush(&mut self) -> Result<(), io::Error> {
         self.inner.flush()
     }
 }
 
 impl AsyncWrite for TcpTransStream {
-    #[inline]
     fn shutdown(&mut self) -> Poll<(), io::Error> {
         AsyncWrite::shutdown(&mut self.inner)
     }
 }
 
 impl Drop for TcpTransStream {
-    #[inline]
     fn drop(&mut self) {
         if let Ok(addr) = self.inner.peer_addr() {
             debug!("Dropped TCP connection to {:?}", addr);
@@ -507,18 +582,31 @@ impl Drop for TcpTransStream {
 
 #[cfg(test)]
 mod tests {
-    use tokio::runtime::current_thread::Runtime;
-    use super::{multiaddr_to_socketaddr, TcpConfig};
-    use futures::stream::Stream;
-    use futures::Future;
-    use std;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use libp2p_core::{
-        Transport,
-        multiaddr::{Multiaddr, Protocol},
-        transport::ListenerEvent
-    };
+    use futures::{prelude::*, future::{self, Loop}, stream};
+    use libp2p_core::{Transport, multiaddr::{Multiaddr, Protocol}, transport::ListenerEvent};
+    use std::{net::{IpAddr, Ipv4Addr, SocketAddr}, time::Duration};
+    use super::{multiaddr_to_socketaddr, TcpConfig, Listener};
+    use tokio::runtime::current_thread::{self, Runtime};
     use tokio_io;
+
+    #[test]
+    fn pause_on_error() {
+        // We create a stream of values and errors and continue polling even after errors
+        // have been encountered. We count the number of items (including errors) and assert
+        // that no item has been missed.
+        let rs = stream::iter_result(vec![Ok(1), Err(1), Ok(1), Err(1)]);
+        let ls = Listener::new(rs, Duration::from_secs(1));
+        let sum = future::loop_fn((0, ls), |(acc, ls)| {
+            ls.into_future().then(move |item| {
+                match item {
+                    Ok((None, _)) => Ok::<_, std::convert::Infallible>(Loop::Break(acc)),
+                    Ok((Some(n), rest)) => Ok(Loop::Continue((acc + n, rest))),
+                    Err((n, rest)) => Ok(Loop::Continue((acc + n, rest)))
+                }
+            })
+        });
+        assert_eq!(4, current_thread::block_on_all(sum).unwrap())
+    }
 
     #[test]
     fn wildcard_expansion() {

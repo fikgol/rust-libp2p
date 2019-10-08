@@ -1,3 +1,51 @@
+# Version 0.12.0 (2019-08-15)
+
+- In some situations, `multistream-select` will now assume that protocol negotiation immediately succeeds. If it turns out that it failed, an error is generated when reading or writing from/to the stream.
+- Replaced `listen_addr` with `local_addr` in events related to incoming connections. The address no longer has to match a previously-reported address.
+- Listeners now have an identifier and can be stopped.
+- Added `NetworkBehaviour::inject_listener_error` and `NetworkBehaviour::inject_listener_closed`. For diagnostic purposes, listeners can now report errors on incoming connections, such as when calling `accept(2)` fails.
+- Fixed tasks sometimes not being notified when a network event happens in `libp2p-mplex`.
+- Fixed a memory leak in `libp2p-kad`.
+- Added `Toggle::is_enabled()`.
+- Removed `IdentifyTransport`.
+
+# Version 0.11.0 (2019-07-18)
+
+- `libp2p-kad`: Completed the core functionality of the record storage API, thereby extending the `RecordStore` for provider records. All records expire by default and are subject to regular republication and caching as per the Kademlia spec(s). Expiration and publication intervals are configurable through the `KademliaConfig`.
+- `libp2p-kad`: The routing table now never stores peers without a known (listen) address. In particular, on receiving a new inbound connection, the Kademlia behaviour now emits `KademliaEvent::UnroutablePeer` to indicate that in order for the peer to be added to the routing table and hence considered a reachable node in the DHT, a listen address of the peer must be discovered and reported via `Kademlia::add_address`. This is usually achieved through the use of the `Identify` protocol on the same connection(s).
+- `libp2p-kad`: Documentation updates.
+- Extracted the `swarm` and `protocols_handler`-related contents from `libp2p-core` to a new `libp2p-swarm` crate.
+- Renamed `RawSwarm` to `Network`.
+- Added `Floodsub::publish_any`.
+- Replaced unbounded channels with bounded ones at the boundary between the `Network` (formerly `RawSwarm`) and `NodeHandler`. The node handlers will now wait if the main task is busy, instead of continuing to push events to the channel.
+- Fixed the `address_translation` function ignoring `/dns` addresses.
+
+# Version 0.10.0 (2019-06-25)
+
+- `PollParameters` is now a trait instead of a struct.
+- The `Swarm` can now be customized with connection information.
+- Fixed write-only substreams now delivering data properly.
+- Fixed the TCP listener accidentally shutting down if an incoming socket was closed too quickly.
+- Improved the heuristics for determining external multiaddresses based on reports.
+- Various fixes to Kademlia iterative queries and the WebSockets transport.
+
+# Version 0.9.1 (2019-06-05)
+
+- `EitherOutput` now implements `Stream` and `Sink` if their variants also implement these traits.
+- `libp2p::websocket::error::Error` now implements `Sync`.
+
+# Version 0.9.0 (2019-06-04)
+
+- Major fixes and performance improvements to libp2p-kad.
+- Initial prototype for record storage in libp2p-kad.
+- Rewrote the implementation of WebSockets. It now properly supports WebSockets Secure (WSS).
+- Removed `BrowserWsConfig`. Please use `libp2p::wasm_ext::ExtTransport` instead.
+- Added a `Path` parameter to `multiaddr::Protocol::WS` and `WSS`. The string representation when a path is present is respectively `x-parity-ws/<path>` and `x-parity-wss/<path>` where `<path>` is percent-encoded.
+- Fixed an issue with `libp2p-tcp` where the wrong listened address was returned, if the actual address was loopback.
+- Added `core::upgrade::OptionalUpgrade`.
+- Added some utility functions in `core::identity::secp256k1`.
+- It is now possible to inject an artificial connection in the `RawSwarm`.
+
 # Version 0.8.1 (2019-05-15)
 
 - Fixed a vulnerability in ED25519 signatures verification in libp2p-core.

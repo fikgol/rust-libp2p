@@ -48,8 +48,8 @@ pub use handler::{PingConfig, PingResult, PingSuccess, PingFailure};
 use handler::PingHandler;
 
 use futures::prelude::*;
-use libp2p_core::swarm::{ConnectedPoint, NetworkBehaviour, NetworkBehaviourAction, PollParameters};
-use libp2p_core::{Multiaddr, PeerId};
+use libp2p_core::{ConnectedPoint, Multiaddr, PeerId};
+use libp2p_swarm::{NetworkBehaviour, NetworkBehaviourAction, PollParameters};
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use tokio_io::{AsyncRead, AsyncWrite};
@@ -116,7 +116,7 @@ where
         self.events.push_front(PingEvent { peer, result })
     }
 
-    fn poll(&mut self, _: &mut PollParameters<'_>) -> Async<NetworkBehaviourAction<Void, PingEvent>>
+    fn poll(&mut self, _: &mut impl PollParameters) -> Async<NetworkBehaviourAction<Void, PingEvent>>
     {
         if let Some(e) = self.events.pop_back() {
             Async::Ready(NetworkBehaviourAction::GenerateEvent(e))

@@ -47,15 +47,16 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
     let name = &ast.ident;
     let (_, ty_generics, where_clause) = ast.generics.split_for_impl();
     let multiaddr = quote!{::libp2p::core::Multiaddr};
-    let trait_to_impl = quote!{::libp2p::core::swarm::NetworkBehaviour};
-    let net_behv_event_proc = quote!{::libp2p::core::swarm::NetworkBehaviourEventProcess};
+    let trait_to_impl = quote!{::libp2p::swarm::NetworkBehaviour};
+    let net_behv_event_proc = quote!{::libp2p::swarm::NetworkBehaviourEventProcess};
     let either_ident = quote!{::libp2p::core::either::EitherOutput};
-    let network_behaviour_action = quote!{::libp2p::core::swarm::NetworkBehaviourAction};
-    let into_protocols_handler = quote!{::libp2p::core::protocols_handler::IntoProtocolsHandler};
-    let protocols_handler = quote!{::libp2p::core::protocols_handler::ProtocolsHandler};
-    let into_proto_select_ident = quote!{::libp2p::core::protocols_handler::IntoProtocolsHandlerSelect};
+    let network_behaviour_action = quote!{::libp2p::swarm::NetworkBehaviourAction};
+    let into_protocols_handler = quote!{::libp2p::swarm::IntoProtocolsHandler};
+    let protocols_handler = quote!{::libp2p::swarm::ProtocolsHandler};
+    let into_proto_select_ident = quote!{::libp2p::swarm::IntoProtocolsHandlerSelect};
     let peer_id = quote!{::libp2p::core::PeerId};
-    let connected_point = quote!{::libp2p::core::swarm::ConnectedPoint};
+    let connected_point = quote!{::libp2p::core::ConnectedPoint};
+    let listener_id = quote!{::libp2p::core::nodes::ListenerId};
 
     // Name of the type parameter that represents the substream.
     let substream_generic = {
@@ -68,7 +69,7 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
         quote!{#n}
     };
 
-    let poll_parameters = quote!{::libp2p::core::swarm::PollParameters};
+    let poll_parameters = quote!{::libp2p::swarm::PollParameters};
 
     // Build the generics.
     let impl_generics = {
@@ -284,6 +285,32 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
         })
     };
 
+    // Build the list of statements to put in the body of `inject_listener_error()`.
+    let inject_listener_error_stmts = {
+        data_struct.fields.iter().enumerate().filter_map(move |(field_n, field)| {
+            if is_ignored(&field) {
+                return None
+            }
+            Some(match field.ident {
+                Some(ref i) => quote!(self.#i.inject_listener_error(id, err);),
+                None => quote!(self.#field_n.inject_listener_error(id, err);)
+            })
+        })
+    };
+
+    // Build the list of statements to put in the body of `inject_listener_closed()`.
+    let inject_listener_closed_stmts = {
+        data_struct.fields.iter().enumerate().filter_map(move |(field_n, field)| {
+            if is_ignored(&field) {
+                return None
+            }
+            Some(match field.ident {
+                Some(ref i) => quote!(self.#i.inject_listener_closed(id);),
+                None => quote!(self.#field_n.inject_listener_closed(id);)
+            })
+        })
+    };
+
     // Build the list of variants to put in the body of `inject_node_event()`.
     //
     // The event type is a construction of nested `#either_ident`s of the events of the children.
@@ -467,6 +494,14 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
                 #(#inject_new_external_addr_stmts);*
             }
 
+            fn inject_listener_error(&mut self, id: #listener_id, err: &(dyn std::error::Error + 'static)) {
+                #(#inject_listener_error_stmts);*
+            }
+
+            fn inject_listener_closed(&mut self, id: #listener_id) {
+                #(#inject_listener_closed_stmts);*
+            }
+
             fn inject_node_event(
                 &mut self,
                 peer_id: #peer_id,
@@ -477,7 +512,7 @@ fn build_struct(ast: &DeriveInput, data_struct: &DataStruct) -> TokenStream {
                 }
             }
 
-            fn poll(&mut self, poll_params: &mut #poll_parameters) -> ::libp2p::futures::Async<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> {
+            fn poll(&mut self, poll_params: &mut impl #poll_parameters) -> ::libp2p::futures::Async<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> {
                 use libp2p::futures::prelude::*;
                 #(#poll_stmts)*
                 let f: ::libp2p::futures::Async<#network_behaviour_action<<<Self::ProtocolsHandler as #into_protocols_handler>::Handler as #protocols_handler>::InEvent, Self::OutEvent>> = #poll_method;

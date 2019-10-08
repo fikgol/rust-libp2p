@@ -25,7 +25,7 @@
 //! any desired protocols. The rest of the module defines combinators for
 //! modifying a transport through composition with other transports or protocol upgrades.
 
-use crate::{InboundUpgrade, OutboundUpgrade, nodes::raw_swarm::ConnectedPoint};
+use crate::{InboundUpgrade, OutboundUpgrade, ConnectedPoint};
 use futures::prelude::*;
 use multiaddr::Multiaddr;
 use std::{error, fmt};
@@ -241,8 +241,8 @@ pub enum ListenerEvent<T> {
     Upgrade {
         /// The upgrade.
         upgrade: T,
-        /// The listening address which produced this upgrade.
-        listen_addr: Multiaddr,
+        /// The local address which produced this upgrade.
+        local_addr: Multiaddr,
         /// The remote address which produced this upgrade.
         remote_addr: Multiaddr
     },
@@ -256,8 +256,8 @@ impl<T> ListenerEvent<T> {
     /// based the the function's result.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> ListenerEvent<U> {
         match self {
-            ListenerEvent::Upgrade { upgrade, listen_addr, remote_addr } => {
-                ListenerEvent::Upgrade { upgrade: f(upgrade), listen_addr, remote_addr }
+            ListenerEvent::Upgrade { upgrade, local_addr, remote_addr } => {
+                ListenerEvent::Upgrade { upgrade: f(upgrade), local_addr, remote_addr }
             }
             ListenerEvent::NewAddress(a) => ListenerEvent::NewAddress(a),
             ListenerEvent::AddressExpired(a) => ListenerEvent::AddressExpired(a)

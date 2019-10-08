@@ -33,16 +33,17 @@
 use bytes::BytesMut;
 use codec::UviBytes;
 use crate::protobuf_structs::dht as proto;
+use crate::record::{self, Record};
 use futures::{future::{self, FutureResult}, sink, stream, Sink, Stream};
 use libp2p_core::{Multiaddr, PeerId};
 use libp2p_core::upgrade::{InboundUpgrade, OutboundUpgrade, UpgradeInfo, Negotiated};
-use multihash::Multihash;
 use protobuf::{self, Message};
-use std::{borrow::Cow, convert::TryFrom};
+use std::{borrow::Cow, convert::TryFrom, time::Duration};
 use std::{io, iter};
 use tokio_codec::Framed;
 use tokio_io::{AsyncRead, AsyncWrite};
 use unsigned_varint::codec;
+use wasm_timer::Instant;
 
 /// Status of our connection to a node reported by the Kademlia protocol.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
@@ -255,24 +256,35 @@ pub enum KadRequestMsg {
     /// Request for the list of nodes whose IDs are the closest to `key`. The number of nodes
     /// returned is not specified, but should be around 20.
     FindNode {
-        /// Identifier of the node.
-        key: PeerId,
+        /// The key for which to locate the closest nodes.
+        key: Vec<u8>,
     },
 
     /// Same as `FindNode`, but should also return the entries of the local providers list for
     /// this key.
     GetProviders {
         /// Identifier being searched.
-        key: Multihash,
+        key: record::Key,
     },
 
     /// Indicates that this list of providers is known for this key.
     AddProvider {
         /// Key for which we should add providers.
-        key: Multihash,
+        key: record::Key,
         /// Known provider for this key.
-        provider_peer: KadPeer,
+        provider: KadPeer,
     },
+
+    /// Request to get a value from the dht records.
+    GetValue {
+        /// The key we are searching for.
+        key: record::Key,
+    },
+
+    /// Request to put a value into the dht records.
+    PutValue {
+        record: Record,
+    }
 }
 
 /// Response that we can send to a peer or that we received from a peer.
@@ -294,6 +306,22 @@ pub enum KadResponseMsg {
         /// Known providers for this key.
         provider_peers: Vec<KadPeer>,
     },
+
+    /// Response to a `GetValue`.
+    GetValue {
+        /// Result that might have been found
+        record: Option<Record>,
+        /// Nodes closest to the key
+        closer_peers: Vec<KadPeer>,
+    },
+
+    /// Response to a `PutValue`.
+    PutValue {
+        /// The key of the record.
+        key: record::Key,
+        /// Value of the record.
+        value: Vec<u8>,
+    },
 }
 
 /// Converts a `KadRequestMsg` into the corresponding protobuf message for sending.
@@ -307,23 +335,37 @@ fn req_msg_to_proto(kad_msg: KadRequestMsg) -> proto::Message {
         KadRequestMsg::FindNode { key } => {
             let mut msg = proto::Message::new();
             msg.set_field_type(proto::Message_MessageType::FIND_NODE);
-            msg.set_key(key.into_bytes());
+            msg.set_key(key);
             msg.set_clusterLevelRaw(10);
             msg
         }
         KadRequestMsg::GetProviders { key } => {
             let mut msg = proto::Message::new();
             msg.set_field_type(proto::Message_MessageType::GET_PROVIDERS);
-            msg.set_key(key.into_bytes());
+            msg.set_key(key.to_vec());
             msg.set_clusterLevelRaw(10);
             msg
         }
-        KadRequestMsg::AddProvider { key, provider_peer } => {
+        KadRequestMsg::AddProvider { key, provider } => {
             let mut msg = proto::Message::new();
             msg.set_field_type(proto::Message_MessageType::ADD_PROVIDER);
             msg.set_clusterLevelRaw(10);
-            msg.set_key(key.into_bytes());
-            msg.mut_providerPeers().push(provider_peer.into());
+            msg.set_key(key.to_vec());
+            msg.mut_providerPeers().push(provider.into());
+            msg
+        }
+        KadRequestMsg::GetValue { key } => {
+            let mut msg = proto::Message::new();
+            msg.set_field_type(proto::Message_MessageType::GET_VALUE);
+            msg.set_clusterLevelRaw(10);
+            msg.set_key(key.to_vec());
+
+            msg
+        }
+        KadRequestMsg::PutValue { record } => {
+            let mut msg = proto::Message::new();
+            msg.set_field_type(proto::Message_MessageType::PUT_VALUE);
+            msg.set_record(record_to_proto(record));
             msg
         }
     }
@@ -361,6 +403,37 @@ fn resp_msg_to_proto(kad_msg: KadResponseMsg) -> proto::Message {
             }
             msg
         }
+        KadResponseMsg::GetValue {
+            record,
+            closer_peers,
+        } => {
+            let mut msg = proto::Message::new();
+            msg.set_field_type(proto::Message_MessageType::GET_VALUE);
+            msg.set_clusterLevelRaw(9);
+            for peer in closer_peers {
+                msg.mut_closerPeers().push(peer.into());
+            }
+            if let Some(record) = record {
+                msg.set_record(record_to_proto(record));
+            }
+
+            msg
+        }
+        KadResponseMsg::PutValue {
+            key,
+            value,
+        } => {
+            let mut msg = proto::Message::new();
+            msg.set_field_type(proto::Message_MessageType::PUT_VALUE);
+            msg.set_key(key.to_vec());
+
+            let mut record = proto::Record::new();
+            record.set_key(key.to_vec());
+            record.set_value(value);
+            msg.set_record(record);
+
+            msg
+        }
     }
 }
 
@@ -371,20 +444,23 @@ fn proto_to_req_msg(mut message: proto::Message) -> Result<KadRequestMsg, io::Er
     match message.get_field_type() {
         proto::Message_MessageType::PING => Ok(KadRequestMsg::Ping),
 
-        proto::Message_MessageType::PUT_VALUE =>
-            Err(invalid_data("Unsupported: PUT_VALUE message.")),
+        proto::Message_MessageType::PUT_VALUE => {
+            let record = record_from_proto(message.take_record())?;
+            Ok(KadRequestMsg::PutValue { record })
+        }
 
-        proto::Message_MessageType::GET_VALUE =>
-            Err(invalid_data("Unsupported: GET_VALUE message.")),
+        proto::Message_MessageType::GET_VALUE => {
+            let key = record::Key::from(message.take_key());
+            Ok(KadRequestMsg::GetValue { key })
+        }
 
         proto::Message_MessageType::FIND_NODE => {
-            let key = PeerId::from_bytes(message.take_key())
-                .map_err(|_| invalid_data("Invalid peer id in FIND_NODE"))?;
+            let key = message.take_key();
             Ok(KadRequestMsg::FindNode { key })
         }
 
         proto::Message_MessageType::GET_PROVIDERS => {
-            let key = Multihash::from_bytes(message.take_key()).map_err(invalid_data)?;
+            let key = record::Key::from(message.take_key());
             Ok(KadRequestMsg::GetProviders { key })
         }
 
@@ -392,14 +468,14 @@ fn proto_to_req_msg(mut message: proto::Message) -> Result<KadRequestMsg, io::Er
             // TODO: for now we don't parse the peer properly, so it is possible that we get
             //       parsing errors for peers even when they are valid; we ignore these
             //       errors for now, but ultimately we should just error altogether
-            let provider_peer = message
+            let provider = message
                 .mut_providerPeers()
                 .iter_mut()
                 .find_map(|peer| KadPeer::try_from(peer).ok());
 
-            if let Some(provider_peer) = provider_peer {
-                let key = Multihash::from_bytes(message.take_key()).map_err(invalid_data)?;
-                Ok(KadRequestMsg::AddProvider { key, provider_peer })
+            if let Some(provider) = provider {
+                let key = record::Key::from(message.take_key());
+                Ok(KadRequestMsg::AddProvider { key, provider })
             } else {
                 Err(invalid_data("ADD_PROVIDER message with no valid peer."))
             }
@@ -414,8 +490,22 @@ fn proto_to_resp_msg(mut message: proto::Message) -> Result<KadResponseMsg, io::
     match message.get_field_type() {
         proto::Message_MessageType::PING => Ok(KadResponseMsg::Pong),
 
-        proto::Message_MessageType::GET_VALUE =>
-            Err(invalid_data("Unsupported: GET_VALUE message")),
+        proto::Message_MessageType::GET_VALUE => {
+            let record =
+                if message.has_record() {
+                    Some(record_from_proto(message.take_record())?)
+                } else {
+                    None
+                };
+
+            let closer_peers = message
+                .mut_closerPeers()
+                .iter_mut()
+                .filter_map(|peer| KadPeer::try_from(peer).ok())
+                .collect::<Vec<_>>();
+
+            Ok(KadResponseMsg::GetValue { record, closer_peers })
+        },
 
         proto::Message_MessageType::FIND_NODE => {
             let closer_peers = message
@@ -446,12 +536,64 @@ fn proto_to_resp_msg(mut message: proto::Message) -> Result<KadResponseMsg, io::
             })
         }
 
-        proto::Message_MessageType::PUT_VALUE =>
-            Err(invalid_data("received an unexpected PUT_VALUE message")),
+        proto::Message_MessageType::PUT_VALUE => {
+            let key = record::Key::from(message.take_key());
+            if !message.has_record() {
+                return Err(invalid_data("received PUT_VALUE message with no record"));
+            }
+
+            let mut record = message.take_record();
+            Ok(KadResponseMsg::PutValue {
+                key,
+                value: record.take_value(),
+            })
+        }
 
         proto::Message_MessageType::ADD_PROVIDER =>
             Err(invalid_data("received an unexpected ADD_PROVIDER message"))
     }
+}
+
+fn record_from_proto(mut record: proto::Record) -> Result<Record, io::Error> {
+    let key = record::Key::from(record.take_key());
+    let value = record.take_value();
+
+    let publisher =
+        if record.publisher.len() > 0 {
+            PeerId::from_bytes(record.take_publisher())
+                .map(Some)
+                .map_err(|_| invalid_data("Invalid publisher peer ID."))?
+        } else {
+            None
+        };
+
+    let expires =
+        if record.ttl > 0 {
+            Some(Instant::now() + Duration::from_secs(record.ttl as u64))
+        } else {
+            None
+        };
+
+    Ok(Record { key, value, publisher, expires })
+}
+
+fn record_to_proto(record: Record) -> proto::Record {
+    let mut pb_record = proto::Record::new();
+    pb_record.key = record.key.to_vec();
+    pb_record.value = record.value;
+    if let Some(p) = record.publisher {
+        pb_record.publisher = p.into_bytes();
+    }
+    if let Some(t) = record.expires {
+        let now = Instant::now();
+        if t > now {
+            pb_record.ttl = (t - now).as_secs() as u32;
+        } else {
+            pb_record.ttl = 1; // because 0 means "does not expire"
+        }
+    }
+
+    pb_record
 }
 
 /// Creates an `io::Error` with `io::ErrorKind::InvalidData`.
