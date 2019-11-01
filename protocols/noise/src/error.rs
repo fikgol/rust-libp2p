@@ -18,8 +18,8 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use snow::SnowError;
 use std::{error::Error, fmt, io};
+use snow::error::{StateProblem, Error as SnowError};
 
 /// libp2p_noise error type.
 #[derive(Debug)]

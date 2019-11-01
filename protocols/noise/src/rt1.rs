@@ -31,6 +31,7 @@ use snow;
 use std::mem;
 use std::marker::PhantomData;
 use tokio_io::{AsyncRead, AsyncWrite};
+use crate::io::SnowState;
 
 /// A future for inbound upgrades.
 ///
@@ -44,10 +45,10 @@ pub struct NoiseInboundFuture<T, C> {
 }
 
 impl<T, C> NoiseInboundFuture<T, C> {
-    pub(super) fn new(io: T, session: Result<snow::Session, NoiseError>) -> Self {
+    pub(super) fn new(io: T, session: Result<snow::HandshakeState, NoiseError>) -> Self {
         match session {
             Ok(s) => NoiseInboundFuture {
-                state: InboundState::RecvHandshake(Handshake::new(io, s)),
+                state: InboundState::RecvHandshake(Handshake::new(io, SnowState::Handshake(s))),
                 _phantom: PhantomData
             },
             Err(e) => NoiseInboundFuture {
@@ -121,10 +122,10 @@ pub struct NoiseOutboundFuture<T, C> {
 }
 
 impl<T, C> NoiseOutboundFuture<T, C> {
-    pub(super) fn new(io: T, session: Result<snow::Session, NoiseError>) -> Self {
+    pub(super) fn new(io: T, session: Result<snow::HandshakeState, NoiseError>) -> Self {
         match session {
             Ok(s) => NoiseOutboundFuture {
-                state: OutboundState::SendHandshake(Handshake::new(io, s)),
+                state: OutboundState::SendHandshake(Handshake::new(io, SnowState::Handshake(s))),
                 _phantom: PhantomData
             },
             Err(e) => NoiseOutboundFuture {
