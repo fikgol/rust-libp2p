@@ -24,8 +24,8 @@ pub mod x25519;
 
 use crate::NoiseError;
 use libp2p_core::identity;
-use rand::FromEntropy;
 use zeroize::Zeroize;
+use rand::SeedableRng;
 
 /// The parameters of a Noise protocol, consisting of a choice
 /// for a handshake pattern as well as DH, cipher and hash functions.
